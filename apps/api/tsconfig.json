@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "baseUrl": ".",
+    "paths": {
+      "@crm/auth": ["../../packages/auth/src"],
+      "@crm/core-db": ["../../packages/core-db/src"],
+      "@crm/policy": ["../../packages/policy/src"],
+      "@crm/schema": ["../../packages/schema/src"]
+    }
+  },
+  "include": ["src"]
+}

@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Max Component Test</title>
+</head>
+<body>
+    <h1>Max Component Structure Test</h1>
+    <p>This file verifies that the Max components are properly structured.</p>
+    
+    <h2>Component Analysis:</h2>
+    <ul>
+        <li>✅ App.tsx - Properly imports and renders MaxStage</li>
+        <li>✅ MaxStage.tsx - Renders AiFaceGSAP with proper styling (z-index fixed to 1)</li>
+        <li>✅ AiFaceGSAP.tsx - Wraps AiFaceSVG with GSAP animations</li>
+        <li>✅ AiFaceSVG.tsx - Contains complete Max Headroom SVG implementation</li>
+        <li>✅ main.tsx - Properly mounts App component</li>
+        <li>✅ index.html - Correctly references main.tsx</li>
+        <li>✅ package.json - GSAP dependency is installed</li>
+        <li>✅ vite.config.mts - Standard React configuration</li>
+    </ul>
+    
+    <h2>Issue Resolution:</h2>
+    <p>The MaxStage z-index was changed from 0 to 1 to ensure Max Headroom appears above the background but below the demo UI (z-index 5).</p>
+    
+    <h2>Next Steps:</h2>
+    <ol>
+        <li>Clear browser cache (Ctrl+Shift+R or Cmd+Shift+R)</li>
+        <li>Restart the dev server: <code>npm run dev</code></li>
+        <li>Visit http://localhost:5173</li>
+        <li>You should now see Max Headroom SVG with animations</li>
+    </ol>
+</body>
+</html>

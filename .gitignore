@@ -1,0 +1,22 @@
+# Node
+node_modules/
+dist/
+build/
+*.log
+
+# Local environment
+.env.local
+.env.development
+.dev/
+tmp/
+*.pid
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor junk
+.vscode/
+.idea/
+*.swp
+.turbo/
