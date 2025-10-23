@@ -56,10 +56,14 @@ export default function aiRoutes(getClient: () => Promise<MongoClient>, dbName: 
                                 text:
                                     "You are Max: a witty on-screen AI operator. If you can respond to the user's request in text than do so briefly." +
                                     "If media is asked for, then you can help to search youtube." +
+                                    "You can also automatically create data models and documents when requested by the user.\n" +
                                     "Return visuals ONLY via a single line that starts with 'VISUAL:' followed by strict JSON.\n" +
                                     "- Image:   VISUAL:{\"type\":\"image\",\"prompt\":\"...\"}\n" +
                                     "- YouTube: VISUAL:{\"type\":\"youtube\",\"search\":\"...\"}\n" +
                                     "- Video:   VISUAL:{\"type\":\"video\",\"url\":\"https://...\"}\n" +
+                                    "Return actions ONLY via a single line that starts with 'ACTION:' followed by strict JSON.\n" +
+                                    "- Create Model: ACTION:{\"type\":\"create_model\",\"name\":\"...\",\"collection\":\"...\",\"fields\":[{\"name\":\"...\",\"type\":\"string\",\"required\":true}]}\n" +
+                                    "- Create Document: ACTION:{\"type\":\"create_document\",\"model\":\"...\",\"data\":{\"field\":\"value\"}}\n" +
                                     "Do not include code fences. Never embed base64 yourself.",
                                 ts: now,
                             },
@@ -174,6 +178,22 @@ export default function aiRoutes(getClient: () => Promise<MongoClient>, dbName: 
                 catch { return { clean: before, visual: null as any }; }
             }
 
+            // ACTION extractor for model/document creation
+            function extractAction(raw: string) {
+                const ix = raw.indexOf("ACTION:");
+                if (ix < 0) return { clean: raw.trim(), action: null as any };
+                const before = raw.slice(0, ix).trim();
+                const a = raw
+                    .slice(ix + 7)
+                    .replace(/^[\s`]*\n?/, "")
+                    .replace(/```json|```/g, "")
+                    .trim();
+                const m = a.match(/\{\s*[\s\S]*?\}/);
+                if (!m) return { clean: before, action: null as any };
+                try { return { clean: before, action: JSON.parse(m[0]) }; }
+                catch { return { clean: before, action: null as any }; }
+            }
+
             function normalizeVisual(v: any): any | null {
                 if (!v || typeof v !== "object") return null;
                 const t = String(v.type || "").toLowerCase().trim();
@@ -237,6 +257,90 @@ export default function aiRoutes(getClient: () => Promise<MongoClient>, dbName: 
                 visual = { type: "video", url: visual.url, caption: visual.caption ?? "" };
             }
 
+            // D) Handle ACTION commands for model/document creation
+            let actionResult: any = null;
+            const { clean: cleanReplyAfterAction, action } = extractAction(cleanReply);
+            cleanReply = cleanReplyAfterAction;
+
+            if (action?.type === "create_model") {
+                try {
+                    const { name, collection, fields } = action;
+                    if (name && collection && Array.isArray(fields)) {
+                        const modelDoc = {
+                            name,
+                            collection,
+                            fields,
+                            tenantId: ctx.tenantId,
+                            createdAt: new Date().toISOString(),
+                            updatedAt: new Date().toISOString(),
+                            createdBy: ctx.user.id,
+                            updatedBy: ctx.user.id,
+                            version: 1,
+                            active: true,
+                        };
+                        
+                        const models = (await getClient()).db(dbName).collection("models");
+                        await models.insertOne(modelDoc);
+                        
+                        const events = (await getClient()).db(dbName).collection('event_store');
+                        await events.insertOne({
+                            tenantId: ctx.tenantId,
+                            type: 'record.created',
+                            model: 'ModelDef',
+                            actor: ctx.user.id,
+                            after: modelDoc,
+                            ts: new Date().toISOString(),
+                        });
+                        
+                        actionResult = { type: "model_created", name, collection };
+                        cleanReply += ` ✓ Created model "${name}" with collection "${collection}".`;
+                    }
+                } catch (err) {
+                    console.error("Model creation failed:", err);
+                    cleanReply += " ❌ Failed to create model.";
+                }
+            } else if (action?.type === "create_document") {
+                try {
+                    const { model: modelName, data } = action;
+                    if (modelName && data && typeof data === "object") {
+                        const models = (await getClient()).db(dbName).collection("models");
+                        const modelDef = await models.findOne({ tenantId: ctx.tenantId, name: modelName, active: true });
+                        
+                        if (modelDef) {
+                            const col = (await getClient()).db(dbName).collection(modelDef.collection);
+                            const doc = {
+                                ...data,
+                                tenantId: ctx.tenantId,
+                                createdAt: new Date().toISOString(),
+                                updatedAt: new Date().toISOString(),
+                                createdBy: ctx.user.id,
+                                updatedBy: ctx.user.id,
+                            };
+                            
+                            await col.insertOne(doc);
+                            
+                            const events = (await getClient()).db(dbName).collection('event_store');
+                            await events.insertOne({
+                                tenantId: ctx.tenantId,
+                                type: 'record.created',
+                                model: modelName,
+                                actor: ctx.user.id,
+                                after: doc,
+                                ts: new Date().toISOString(),
+                            });
+                            
+                            actionResult = { type: "document_created", model: modelName, data };
+                            cleanReply += ` ✓ Created document in "${modelName}".`;
+                        } else {
+                            cleanReply += ` ❌ Model "${modelName}" not found.`;
+                        }
+                    }
+                } catch (err) {
+                    console.error("Document creation failed:", err);
+                    cleanReply += " ❌ Failed to create document.";
+                }
+            }
+
             // 6) Save model reply
             const ms = new Date().toISOString();
             await sessions.updateOne(baseQuery, {
@@ -244,7 +348,7 @@ export default function aiRoutes(getClient: () => Promise<MongoClient>, dbName: 
                 $set: { updatedAt: ms },
             });
 
-            res.json({ replyText: cleanReply, visual });
+            res.json({ replyText: cleanReply, visual, action: actionResult });
         } catch (e) {
             next(e);
         }
