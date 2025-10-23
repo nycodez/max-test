@@ -6,6 +6,8 @@ import Ajv from "ajv";
 import addFormats from "ajv-formats";
 import { MongoClient } from "mongodb";
 import aiRoutes from "./routes/ai";
+import ttsRoutes from "./routes/tts";
+import * as process from "node:process";
 
 // ---- TEMP DEV CONTEXT (no auth) ----
 const DEV_CTX = {
@@ -177,7 +179,12 @@ app.get('/runtime/bootstrap', async (req, res) => {
 
 app.use("/ai", aiRoutes(getClient, DB));
 
-app.listen(PORT, () => console.log(`API (no-auth) on :${PORT}`));
+app.use("/tts", ttsRoutes());
+
+const server = app.listen(PORT, () => console.log(`API (no-auth) on :${PORT}`));
+function shutdown() {
+    server.close(() => process.exit(0));
+}
 
 // Error handler (show stack in dev)
 app.use((err: any, _req: any, res: any, _next: any) => {

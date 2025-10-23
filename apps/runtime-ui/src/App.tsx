@@ -1,84 +1,76 @@
+import React from "react";
 import MaxStage from "./components/MaxStage";
 import { VisualProvider, useVisuals } from "./visuals/VisualProvider";
 import VisualOverlay from "./visuals/VisualOverlay";
 import ChatDock from "./components/ChatDock";
 import VoiceController from "./voice/VoiceController";
-import { TranscriptProvider } from "./voice/TranscriptContext";
+import { TranscriptProvider, useTranscript } from "./voice/TranscriptContext";
 import MicTranscriptOverlay from "./components/MicTranscriptOverlay";
-import React from "react";
 
-const ACCENT = "#7C3AED";
-const API = "http://localhost:8080";
+const ACCENT = import.meta.env.VITE_TENANT_COLOR ?? "#7C3AED";
+const API = import.meta.env.VITE_API_URL || "http://localhost:8080";
 
-class Boundary extends React.Component<{children: React.ReactNode},{err?: any}> {
-    state = { err: null as any };
-    static getDerivedStateFromError(err: any){ return { err }; }
-    render(){
-        if (this.state.err) return (
-            <div style={{color:"#fff", background:"#111", padding:20}}>
-                <h3>UI crashed</h3>
-                <pre style={{whiteSpace:"pre-wrap"}}>{String(this.state.err?.stack || this.state.err)}</pre>
-            </div>
-        );
-        return this.props.children as any;
-    }
+// 🔹 Unified backend call that handles reply + visuals
+async function askBackend(text: string, sessionId: string) {
+    const res = await fetch(`${API}/ai/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, sessionId }),
+    });
+
+    const data = await res.json();
+    return {
+        replyText: data.replyText ?? "Okay.",
+        visual: data.visual ?? null,
+    };
+}
+
+function useSessionId() {
+    const key = "maxSessionId";
+    const v = localStorage.getItem(key);
+    if (v) return v;
+    const n = Math.random().toString(36).slice(2);
+    localStorage.setItem(key, n);
+    return n;
 }
 
 export default function App() {
-    const sessionId = ensureSessionId();
-
-    async function handleUserText(text: string) {
-        const r = await fetch(`${API}/ai/chat`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text, sessionId }),
-        });
-        const data = await r.json();
-        // Optionally pop visuals if model asked for one
-        if (data.visual) {
-            // example shape: {type:"image", url:"..."} or {type:"youtube", id:"..."}
-            // you'll need to call useVisuals().show(...) from inside a component; simple approach:
-            (window as any).__pendingVisual = data.visual;
-            const evt = new CustomEvent("max-visual"); window.dispatchEvent(evt);
-        }
-        return { replyText: data.replyText, speak: false }; // no TTS echo
-    }
-
-    // a small bridge to trigger VisualOverlay from anywhere (optional)
-    function VisualBridge() {
-        const { show } = useVisuals();
-        React.useEffect(() => {
-            const on = () => {
-                const v = (window as any).__pendingVisual;
-                if (v) { show(v); (window as any).__pendingVisual = null; }
-            };
-            window.addEventListener("max-visual", on);
-            return () => window.removeEventListener("max-visual", on);
-        }, [show]);
-        return null;
-    }
+    const sessionId = useSessionId();
 
     return (
-        <Boundary>
-            <TranscriptProvider>
-                <VisualProvider>
-                    <MaxStage accentHex={ACCENT} />
-                    <VisualOverlay />
-                    <VisualBridge />
-                    <ChatDock onSend={handleUserText} />
-                    <VoiceController onUserText={handleUserText} />
-                    <MicTranscriptOverlay />
-                </VisualProvider>
-            </TranscriptProvider>
-        </Boundary>
+        <TranscriptProvider>
+            <VisualProvider>
+                <AppContent sessionId={sessionId} />
+                <VisualOverlay />
+            </VisualProvider>
+        </TranscriptProvider>
     );
 }
 
-function ensureSessionId() {
-    const k = "maxSessionId";
-    const v = localStorage.getItem(k);
-    if (v) return v;
-    const n = Math.random().toString(36).slice(2);
-    localStorage.setItem(k, n);
-    return n;
+// Create a separate component that can use hooks safely
+function AppContent({ sessionId }: { sessionId: string }) {
+    const transcript = useTranscript();
+    const { show: showVisual } = useVisuals();
+
+    // 🧠 Handles user text from ChatDock *and* from VoiceController
+    async function processUserText(text: string) {
+        transcript.pushUser(text);
+
+        const { replyText, visual } = await askBackend(text, sessionId);
+
+        transcript.pushAssistant(replyText);
+        if (visual) showVisual(visual); // show image/video in modal
+
+        // Return reply to VoiceController so it can speak it
+        return { replyText, speak: true };
+    }
+
+    return (
+        <>
+            <MaxStage accentHex={ACCENT} />
+            <ChatDock onSend={(t) => processUserText(t)} />
+            <VoiceController onUserText={processUserText} speakAssistant={true} />
+            <MicTranscriptOverlay />
+        </>
+    );
 }
