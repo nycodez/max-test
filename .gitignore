@@ -5,11 +5,13 @@ build/
 *.log
 
 # Local environment
+apps/api/.env
 .env.local
 .env.development
 .dev/
 tmp/
 *.pid
+keys/*
 
 # OS files
 .DS_Store
