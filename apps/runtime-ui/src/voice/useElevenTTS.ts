@@ -33,7 +33,7 @@ export function useElevenTTS(apiBase: string) {
         const ac = new AbortController();
         fetchAbort.current = ac;
 
-        const r = await fetch(`${apiBase}/tts/eleven`, {
+        const r = await fetch(`${apiBase}/tts/native`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ text, ...opts }),

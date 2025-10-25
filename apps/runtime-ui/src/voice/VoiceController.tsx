@@ -9,7 +9,7 @@ import { useElevenTTS } from "./useElevenTTS";
 export type OnUserTextResult = string | { replyText?: string; speak?: boolean };
 export type VoiceControllerProps = {
     enabled?: boolean;
-    onUserText?: (text: string) => Promise<OnUserTextResult> | OnUserTextResult;
+    onUserText?: (text: string, skipTranscript?: boolean) => Promise<OnUserTextResult> | OnUserTextResult;
     speakAssistant?: boolean;   // default true
     allowBargeIn?: boolean;     // default true
 };
@@ -131,7 +131,7 @@ export default function VoiceController({
 
         (async () => {
             try {
-                const result = await onUserText?.(final);
+                const result = await onUserText?.(final, true); // skipTranscript=true to avoid duplication
                 const reply =
                     typeof result === "string" ? result : (result?.replyText ?? "Okay.");
                 const shouldSpeak =

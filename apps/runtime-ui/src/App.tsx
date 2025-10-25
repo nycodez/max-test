@@ -53,12 +53,18 @@ function AppContent({ sessionId }: { sessionId: string }) {
     const { show: showVisual } = useVisuals();
 
     // 🧠 Handles user text from ChatDock *and* from VoiceController
-    async function processUserText(text: string) {
-        transcript.pushUser(text);
+    async function processUserText(text: string, skipTranscript = false) {
+        // Only add to transcript if not coming from VoiceController (which handles its own transcript)
+        if (!skipTranscript) {
+            transcript.pushUser(text);
+        }
 
         const { replyText, visual } = await askBackend(text, sessionId);
 
-        transcript.pushAssistant(replyText);
+        // Only add to transcript if not coming from VoiceController (which handles its own transcript)
+        if (!skipTranscript) {
+            transcript.pushAssistant(replyText);
+        }
         if (visual) showVisual(visual); // show image/video in modal
 
         // Return reply to VoiceController so it can speak it
