@@ -16,6 +16,31 @@ type SessionDoc = {
     updatedAt: string;
 };
 
+const SYSTEM_PROMPT =
+    "You are Max: a witty on-screen AI operator. If you can respond to the user's request in text than do so briefly." +
+    "If media is asked for, then you can help to search youtube." +
+    "You can also automatically create data models and documents when requested by the user.\n" +
+    "Return visuals ONLY via a single line that starts with 'VISUAL:' followed by strict JSON.\n" +
+    "- Image:   VISUAL:{\"type\":\"image\",\"prompt\":\"...\"}\n" +
+    "- YouTube: VISUAL:{\"type\":\"youtube\",\"search\":\"...\"}\n" +
+    "- Video:   VISUAL:{\"type\":\"video\",\"url\":\"https://...\"}\n" +
+    "Return actions ONLY via a single line that starts with 'ACTION:' followed by strict JSON.\n" +
+    "- Create Model: ACTION:{\"type\":\"create_model\",\"name\":\"...\",\"collection\":\"...\",\"fields\":[{\"name\":\"...\",\"type\":\"string\",\"required\":true}]}\n" +
+    "- Create Document: ACTION:{\"type\":\"create_document\",\"model\":\"...\",\"data\":{\"field\":\"value\"}}\n" +
+    "Do not include code fences. Never embed base64 yourself.";
+
+function getSessionTitle(messages: Msg[]): string {
+    const firstUser = messages.find((msg) => msg.role === "user" && msg.text?.trim());
+    if (!firstUser) return "Untitled Chat";
+    const trimmed = firstUser.text.trim().replace(/\s+/g, " ");
+    return trimmed.length > 80 ? `${trimmed.slice(0, 80)}...` : trimmed;
+}
+
+function writeSse(res: any, event: string, payload: unknown): void {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
 export default function aiRoutes(getClient: () => Promise<MongoClient>, dbName: string) {
     // apps/api/src/routes/ai.ts (temporarily)
     router.get("/ping", async (_req, res, next) => {
@@ -29,9 +54,202 @@ export default function aiRoutes(getClient: () => Promise<MongoClient>, dbName: 
         } catch (e) { next(e); }
     });
 
+    router.get("/threads", async (req, res, next) => {
+        try {
+            const ctx = (req as any).ctx || { tenantId: "tenant-A", user: { id: "dev-user" } };
+            const limit = Math.max(1, Math.min(100, Number(req.query.limit ?? 20)));
+            const offset = Math.max(0, Number(req.query.offset ?? 0));
+
+            const db = (await getClient()).db(dbName);
+            const sessions = db.collection<SessionDoc>("ai_sessions");
+
+            const rows = await sessions
+                .find({ tenantId: ctx.tenantId, userId: ctx.user.id })
+                .sort({ updatedAt: -1 })
+                .skip(offset)
+                .limit(limit)
+                .toArray();
+
+            const threads = rows.map((session) => ({
+                id: session.sessionId,
+                title: getSessionTitle(session.messages || []),
+                updatedAt: session.updatedAt,
+            }));
+
+            res.json({ threads });
+        } catch (e) {
+            next(e);
+        }
+    });
+
+    router.get("/threads/:threadId/messages", async (req, res, next) => {
+        try {
+            const ctx = (req as any).ctx || { tenantId: "tenant-A", user: { id: "dev-user" } };
+            const threadId = String(req.params.threadId || "").trim();
+            if (!threadId) return res.status(400).json({ error: "Missing threadId" });
+
+            const db = (await getClient()).db(dbName);
+            const sessions = db.collection<SessionDoc>("ai_sessions");
+            const row = await sessions.findOne({
+                tenantId: ctx.tenantId,
+                userId: ctx.user.id,
+                sessionId: threadId,
+            });
+
+            if (!row) return res.json({ messages: [] });
+
+            const messages = (row.messages || [])
+                .filter((msg) => msg.role === "user" || msg.role === "model")
+                .map((msg, index) => ({
+                    id: `${threadId}-${index + 1}`,
+                    role: msg.role === "model" ? "agent" : "user",
+                    content: msg.text,
+                    createdAt: msg.ts,
+                }));
+
+            res.json({ messages });
+        } catch (e) {
+            next(e);
+        }
+    });
+
+    router.delete("/threads/:threadId", async (req, res, next) => {
+        try {
+            const ctx = (req as any).ctx || { tenantId: "tenant-A", user: { id: "dev-user" } };
+            const threadId = String(req.params.threadId || "").trim();
+            if (!threadId) return res.status(400).json({ error: "Missing threadId" });
+
+            const db = (await getClient()).db(dbName);
+            const sessions = db.collection<SessionDoc>("ai_sessions");
+            await sessions.deleteOne({
+                tenantId: ctx.tenantId,
+                userId: ctx.user.id,
+                sessionId: threadId,
+            });
+
+            res.json({ success: true });
+        } catch (e) {
+            next(e);
+        }
+    });
+
+    router.post("/chat/stream", async (req, res, next) => {
+        try {
+            const { text, threadId } = req.body || {};
+            if (!text || !String(text).trim()) {
+                return res.status(400).json({ error: "Missing text" });
+            }
+
+            const ctx = (req as any).ctx || { tenantId: "tenant-A", user: { id: "dev-user" } };
+            const db = (await getClient()).db(dbName);
+            const sessions = db.collection<SessionDoc>("ai_sessions");
+
+            const now = new Date().toISOString();
+            const sid = String(threadId || "").trim() || new ObjectId().toHexString();
+            const baseQuery = { tenantId: ctx.tenantId, userId: ctx.user.id, sessionId: sid };
+
+            await sessions.updateOne(
+                baseQuery,
+                {
+                    $setOnInsert: {
+                        tenantId: ctx.tenantId,
+                        userId: ctx.user.id,
+                        sessionId: sid,
+                        messages: [
+                            {
+                                role: "system",
+                                text: SYSTEM_PROMPT,
+                                ts: now,
+                            },
+                        ],
+                        createdAt: now,
+                        updatedAt: now,
+                    },
+                },
+                { upsert: true }
+            );
+
+            const afterUser = await sessions.findOneAndUpdate(
+                baseQuery,
+                {
+                    $push: { messages: { role: "user", text: String(text), ts: now } },
+                    $set: { updatedAt: now },
+                },
+                { returnDocument: "after" as any }
+            );
+
+            const convo: SessionDoc | null = afterUser ?? null;
+            if (!convo) return res.status(500).json({ error: "Failed to load session" });
+
+            const title = getSessionTitle(convo.messages || []);
+            const history = (convo.messages || []).slice(-16);
+            const contents = history.map((m) => ({
+                role: m.role === "model" ? "model" : "user",
+                parts: [{ text: m.text }],
+            }));
+
+            res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+            res.setHeader("Cache-Control", "no-cache, no-transform");
+            res.setHeader("Connection", "keep-alive");
+            res.setHeader("X-Accel-Buffering", "no");
+            res.flushHeaders?.();
+
+            writeSse(res, "meta", { threadId: sid, threadTitle: title });
+
+            const model = getGemini();
+            const streamResult = await model.generateContentStream({ contents });
+
+            let fullText = "";
+            for await (const item of streamResult.stream) {
+                const delta = (item?.candidates?.[0]?.content?.parts ?? [])
+                    .map((part: any) => part?.text ?? "")
+                    .join("");
+
+                if (!delta) continue;
+
+                fullText += delta;
+                writeSse(res, "delta", {
+                    threadId: sid,
+                    threadTitle: title,
+                    delta,
+                    text: fullText,
+                });
+            }
+
+            if (!fullText.trim()) {
+                const finalResponse = await streamResult.response;
+                fullText = (finalResponse?.candidates?.[0]?.content?.parts ?? [])
+                    .map((part: any) => part?.text ?? "")
+                    .join("")
+                    .trim();
+            }
+
+            const finalText = fullText.trim() || "Okay.";
+            const ts = new Date().toISOString();
+            await sessions.updateOne(baseQuery, {
+                $push: { messages: { role: "model", text: finalText, ts } },
+                $set: { updatedAt: ts },
+            });
+
+            writeSse(res, "done", {
+                threadId: sid,
+                threadTitle: title,
+                text: finalText,
+            });
+            res.end();
+        } catch (e: any) {
+            try {
+                writeSse(res, "error", { message: e?.message || "Streaming failed" });
+                res.end();
+            } catch {
+                next(e);
+            }
+        }
+    });
+
     router.post("/chat", async (req, res, next) => {
         try {
-            const { text, sessionId } = req.body || {};
+            const { text, sessionId, threadId } = req.body || {};
             if (!text) return res.status(400).json({ error: "Missing text" });
 
             const ctx = (req as any).ctx || { tenantId: "tenant-A", user: { id: "dev-user" } };
@@ -39,7 +257,7 @@ export default function aiRoutes(getClient: () => Promise<MongoClient>, dbName: 
             const sessions = db.collection<SessionDoc>("ai_sessions");
 
             const now = new Date().toISOString();
-            const sid = sessionId || "default";
+            const sid = String(threadId || sessionId || "").trim() || new ObjectId().toHexString();
             const baseQuery = { tenantId: ctx.tenantId, userId: ctx.user.id, sessionId: sid };
 
             // 1) Ensure session exists
@@ -348,7 +566,8 @@ export default function aiRoutes(getClient: () => Promise<MongoClient>, dbName: 
                 $set: { updatedAt: ms },
             });
 
-            res.json({ replyText: cleanReply, visual, action: actionResult });
+            const threadTitle = getSessionTitle(convo.messages ?? []);
+            res.json({ replyText: cleanReply, threadId: sid, threadTitle, visual, action: actionResult });
         } catch (e) {
             next(e);
         }
