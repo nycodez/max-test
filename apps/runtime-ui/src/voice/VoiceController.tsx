@@ -2,9 +2,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useMicLevel } from "./useMicLevel";
 import { useSpeechToText } from "./useSpeechToText";
-import { useTextToSpeech } from "./useTextToSpeech";
 import { useTranscript } from "./TranscriptContext";
-import { useElevenTTS } from "./useElevenTTS";
+import { useServerTTS } from "./useServerTTS";
 
 export type OnUserTextResult = string | { replyText?: string; speak?: boolean };
 export type VoiceControllerProps = {
@@ -21,7 +20,7 @@ export default function VoiceController({
                                             allowBargeIn = true,
                                         }: VoiceControllerProps) {
     const API = (import.meta as any).env?.VITE_API_URL || "http://localhost:8080";
-    const tts = useElevenTTS(API);
+    const tts = useServerTTS(API);
     const sttEnabled = enabled && !tts.speaking;
     const stt = useSpeechToText(sttEnabled);
 
@@ -144,9 +143,7 @@ export default function VoiceController({
                 if (reply && shouldSpeak) {
                     lastTtsStartRef.current = Date.now();
                     await tts.say(reply, {
-                        // voiceId: "<override>",
-                        // modelId: "eleven_multilingual_v2",
-                        // voice_settings: { stability: 0.4, similarity_boost: 0.7, style: 0.3, use_speaker_boost: true },
+                        // voice: "en-US-Neural2-F",
                     });
                 }
             } finally {

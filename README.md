@@ -1,59 +1,27 @@
-# Max - AI-Powered CRM Platform
+# Max - AI CRM Operator
 
-Max is an intelligent, voice-enabled Customer Relationship Management (CRM) platform that combines traditional CRM functionality with advanced AI capabilities for natural, conversational user interactions.
+Max is a voice-enabled CRM operator with a focused MVP: users can talk or type to create and review contacts, companies, and follow-up tasks from one runtime UI.
 
-## What is Max?
+## Current MVP
 
-Max is a comprehensive business platform that enables organizations to:
+Max currently focuses on one concrete workflow:
 
-- **Manage Customer Data**: Create and manage dynamic data models, forms, and workflows tailored to your business needs
-- **Interact Naturally**: Communicate with your CRM using voice commands and natural language through "Max," an AI assistant
-- **Generate Content**: Create images, search YouTube videos, and generate visual content on demand
-- **Scale Multi-Tenant**: Support multiple organizations with complete data isolation and tenant-specific configurations
+- **Create CRM records**: add contacts, companies, and follow-up tasks from chat or voice
+- **Review recent work**: list recent records and open tasks in the operator workspace
+- **Keep thread history**: store assistant conversations per tenant/user
+- **Support hands-free operation**: keep the existing voice transcription and TTS loop for operators who want it
 
 ## Key Features
 
-### 🤖 AI-Powered Assistant ("Max")
-- **Voice Interaction**: Hands-free operation with speech-to-text and text-to-speech capabilities
-- **Natural Language Processing**: Powered by Google Vertex AI (Gemini) for intelligent conversations
-- **Automatic Command Execution**: AI can automatically create data models and documents based on user requests
-- **Visual Content Generation**: Create images using AI-generated prompts
-- **YouTube Integration**: Search and embed relevant videos based by user requests
-- **Barge-in Support**: Interrupt the AI mid-response for more natural conversations
-
-### 🏢 Dynamic CRM Core
-- **Custom Data Models**: Define and manage business-specific data structures dynamically
-- **Form Builder**: Create custom forms tied to your data models
-- **Workflow Management**: Design and execute business processes
-- **Event Sourcing**: Complete audit trail of all data changes
-- **Query Engine**: Flexible data querying and reporting
+### Assistant + Operator UI
+- **Voice Interaction**: speech-to-text plus Google Cloud TTS with native fallback
+- **Typed CRM Actions**: validated actions for creating and listing contacts, companies, and tasks
+- **Operator Workspace**: thread list, message history, CRM snapshot, and action results in one screen
+- **Barge-in Support**: interrupt spoken replies naturally
 
 ### 🌐 Multi-Tenant Architecture
-- **Complete Isolation**: Each tenant has separate data, configurations, and users
-- **Scalable Design**: Support unlimited organizations on a single deployment
-- **Role-Based Access**: Granular permissions and capability management
-- **Tenant-Specific Customization**: Each organization can customize models, forms, and workflows
-
-### 🎙️ Advanced Voice Features
-- **High-Quality TTS**: ElevenLabs integration for natural-sounding voice synthesis
-- **Voice Activity Detection**: Intelligent detection of when users are speaking
-- **Real-time Transcription**: Live speech-to-text with partial results
-- **Configurable Voice Settings**: Customize voice characteristics, speed, and style
-
-## Who is Max For?
-
-### Primary Users
-- **Small to Medium Businesses**: Organizations needing a flexible, AI-enhanced CRM without complex setup
-- **Customer Service Teams**: Teams wanting hands-free, voice-driven customer interaction tools
-- **Sales Organizations**: Sales teams needing quick access to customer data and content generation
-- **Service Providers**: Businesses requiring custom data models and workflow automation
-
-### Use Cases
-- **Voice-First CRM**: Manage customer relationships using natural voice commands
-- **Dynamic Business Applications**: Create custom business apps without traditional development
-- **AI-Enhanced Customer Support**: Provide intelligent, context-aware customer assistance
-- **Content-Rich Presentations**: Generate images and videos for customer interactions
-- **Multi-Location Businesses**: Manage multiple branches/franchises with separate data spaces
+- **Tenant-scoped data**: MongoDB reads and writes are scoped by `tenantId`
+- **JWT or local dev auth**: production should use verified JWTs; local development can opt into dev auth
 
 ## Technical Architecture
 
@@ -61,20 +29,13 @@ Max is a comprehensive business platform that enables organizations to:
 - **Node.js/Express**: RESTful API with TypeScript
 - **MongoDB**: Document-based storage with multi-tenant data isolation
 - **Google Vertex AI**: Large language model integration for conversational AI
-- **ElevenLabs**: Professional text-to-speech synthesis
-- **Dynamic Schema**: Runtime model definition and validation
+- **Typed CRM Actions**: server-validated actions rather than freeform prompt automation
 
 ### Frontend (Runtime UI)
 - **React/TypeScript**: Modern web application with Vite build system
 - **Voice Processing**: Real-time speech recognition and audio processing
 - **GSAP Animations**: Smooth, professional user interface animations
-- **Responsive Design**: Works across desktop and mobile devices
-
-### Data Architecture
-- **Event Sourcing**: Complete audit trail of all system changes
-- **Multi-Tenant**: Isolated data spaces for each organization
-- **Dynamic Models**: Runtime-defined data structures and validation
-- **Bootstrap API**: Configuration-driven UI generation
+- **Operator Console**: conversation history, CRM snapshot, and typed composer
 
 ## Getting Started
 
@@ -83,26 +44,48 @@ Max is a comprehensive business platform that enables organizations to:
 # Install dependencies
 pnpm install
 
-# Start API server
-pnpm dev:api
+# Start API + UI together
+pnpm dev
+```
 
-# Start UI application (in another terminal)
+If you only need one side during development:
+
+```bash
+pnpm dev:api
 pnpm dev:ui
 ```
 
 ### Environment Configuration
 The system requires:
 - MongoDB connection
-- Google Cloud Vertex AI credentials
-- ElevenLabs API key (for voice synthesis)
-- Optional: YouTube API key for video search
+- `JWT_SECRET` for verified bearer tokens in non-dev environments
+- Root `max/.env` is the default env source; set `API_ENV_OVERRIDE=true` only if you intentionally want `apps/api/.env` to override it
+- Google Cloud Vertex AI credentials for AI planning
+- `VERTEX_ENABLED=false` if you want local heuristic-only mode without Vertex auth
+- `VERTEX_RETRY_COOLDOWN_MS` to control temporary backoff after Vertex auth/network errors
+- `VERTEX_LOG_UNAVAILABLE=false` to suppress noisy Vertex fallback warnings in dev logs
+- Optional local intent router via Ollama (`LOCAL_ROUTER_ENABLED`, `LOCAL_ROUTER_URL`, `LOCAL_ROUTER_MODEL`)
+- `AI_TRACE_LOGS=true` to print per-request routing and model flow logs in API console
+- `AGENT_TOOLS_CONFIG_PATH` points to the JSON tool registry (default `./config/agent-tools.json`)
+- Google Cloud auth for TTS if you want server-side natural voice output
+- Optional: `ALLOW_DEV_AUTH=true` for local development without a full auth system
+
+### Agent Tools Registry
+- Tool and ability configuration lives in `max/config/agent-tools.json`
+- The API hot-reloads this file based on file timestamp, so edits do not require code changes
+- Inspect effective registry at `GET /ai/tools`
+- Supported `access.method` values:
+  - `local.weather_open_meteo`
+  - `local.time_lookup`
+  - `crm.create_contact`, `crm.create_company`, `crm.create_task`
+  - `crm.list_contacts`, `crm.list_companies`, `crm.list_tasks`
 
 ### Production Deployment
 Max is designed for cloud deployment with proper authentication, tenant provisioning, and scalable infrastructure.
 
 ## System Status
 
-**Current Version**: 1.0.0  
-**Development Status**: Active development with core features implemented  
-**Authentication**: Currently in development mode (production auth planned)  
-**Multi-tenancy**: Fully implemented with tenant isolation
+**Current Version**: 1.0.0
+**Development Status**: MVP hardening in progress
+**Authentication**: verified JWT support plus opt-in local dev auth
+**MVP Scope**: contacts, companies, tasks, thread history, typed AI actions, voice overlay

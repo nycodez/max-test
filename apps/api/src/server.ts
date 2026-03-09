@@ -1,27 +1,48 @@
-import "dotenv/config";
-import express from "express";
-import cors from "cors";
+import * as fs from "fs";
+import * as path from "path";
+import dotenv from "dotenv";
 import bodyParser from "body-parser";
+import cors from "cors";
+import express, { NextFunction, Request, Response } from "express";
 import Ajv from "ajv";
 import addFormats from "ajv-formats";
+import { createHash } from "crypto";
 import { MongoClient } from "mongodb";
+import { getReqCtx, type ReqCtx } from "@crm/auth";
 import aiRoutes from "./routes/ai";
+import crmRoutes from "./routes/crm";
 import ttsRoutes from "./routes/tts";
-import * as process from "node:process";
 
-// ---- TEMP DEV CONTEXT (no auth) ----
-const DEV_CTX = {
-    tenantId: "tenant-A",
-    user: { id: "dev-user", role: "admin", caps: ["*"] },
-};
-// ------------------------------------
+function loadEnvironment(): void {
+    const workspaceEnvPath = path.resolve(__dirname, "../../../.env");
+    const apiEnvPath = path.resolve(__dirname, "../.env");
+
+    if (fs.existsSync(workspaceEnvPath)) {
+        dotenv.config({ path: workspaceEnvPath, quiet: true });
+    }
+
+    const apiOverrideEnabled = (() => {
+        const raw = String(process.env.API_ENV_OVERRIDE ?? "").trim().toLowerCase();
+        return ["1", "true", "yes", "on", "enabled"].includes(raw);
+    })();
+
+    if (apiOverrideEnabled && fs.existsSync(apiEnvPath)) {
+        dotenv.config({ path: apiEnvPath, override: true, quiet: true });
+    }
+}
+
+loadEnvironment();
+
+type AuthedRequest = Request & { ctx: ReqCtx };
 
 const PORT = process.env.PORT || 8080;
 const DB = process.env.MONGO_DB || "crm";
 const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017";
+const JWT_SECRET = process.env.JWT_SECRET;
+const ALLOW_DEV_AUTH = process.env.ALLOW_DEV_AUTH === "true" || process.env.NODE_ENV !== "production";
 
-const ajv = new Ajv({ allErrors: true }); addFormats(ajv);
-// super-minimal schema so we can post a model
+const ajv = new Ajv({ allErrors: true });
+addFormats(ajv);
 const validateModel = ajv.compile({
     type: "object",
     required: ["name", "collection", "fields"],
@@ -30,38 +51,54 @@ const validateModel = ajv.compile({
         collection: { type: "string" },
         fields: { type: "array" },
         version: { type: "number" },
-        active: { type: "boolean" }
+        active: { type: "boolean" },
     },
-    additionalProperties: true
+    additionalProperties: true,
 });
 
 let client: MongoClient;
-async function getClient() {
+let connectPromise: Promise<MongoClient> | null = null;
+
+async function getClient(): Promise<MongoClient> {
     if (!client) client = new MongoClient(MONGO_URI);
-    if (!client.topology?.isConnected()) await client.connect();
-    return client;
+    if (!connectPromise) {
+        connectPromise = client.connect().then(() => client);
+    }
+    return connectPromise;
 }
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// Debug endpoint BEFORE anything else
-app.get("/__debug/headers-open", (req, res) => res.json(req.headers));
-
-// Inject dev ctx (no auth)
-app.use((req, _res, next) => {
-    const forced = (req.header('x-tenant-id') || 'tenant-A').trim();
-    (req as any).ctx = { tenantId: forced, user: { id: 'dev-user', role: 'admin', caps: ['*'] } };
-    next();
+app.get("/__health", (_req, res) => {
+    res.json({
+        ok: true,
+        time: new Date().toISOString(),
+        authMode: ALLOW_DEV_AUTH ? "jwt-or-dev" : "jwt-only",
+    });
 });
 
-// ---- DESIGN: models ----
-app.post("/design/models", async (req, res, next) => {
+app.use((req: Request, _res: Response, next: NextFunction) => {
     try {
-        const ctx = (req as any).ctx;
-        const c = (await getClient()).db(DB).collection("models");
+        (req as AuthedRequest).ctx = getReqCtx(req.header("authorization") ?? undefined, {
+            jwtSecret: JWT_SECRET,
+            allowDevAuth: ALLOW_DEV_AUTH,
+            devTenantId: process.env.DEV_TENANT_ID,
+            devUserId: process.env.DEV_USER_ID,
+            devRole: "admin",
+            devCaps: ["*"],
+        });
+        next();
+    } catch (error) {
+        next(error);
+    }
+});
 
+app.post("/design/models", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const ctx = (req as AuthedRequest).ctx;
+        const collection = (await getClient()).db(DB).collection("models");
         const payload = req.body || {};
         if (!validateModel(payload)) return res.status(422).json({ errors: validateModel.errors });
 
@@ -76,118 +113,169 @@ app.post("/design/models", async (req, res, next) => {
             version: payload.version ?? 1,
             active: payload.active ?? true,
         };
-        await c.insertOne(doc);
-        const events = (await getClient()).db(DB).collection('event_store');
-        await events.insertOne({
+
+        await collection.insertOne(doc);
+        await (await getClient()).db(DB).collection("event_store").insertOne({
             tenantId: ctx.tenantId,
-            type: 'record.created',
-            model: req.params.model || 'ModelDef',
+            type: "record.created",
+            model: "ModelDef",
             actor: ctx.user.id,
-            after: doc,                // the inserted doc
-            ts: new Date().toISOString(),
+            after: doc,
+            ts: now,
         });
+
         res.status(201).json({ ok: true });
-    } catch (e) { next(e); }
+    } catch (error) {
+        next(error);
+    }
 });
 
-app.get("/design/models/:name", async (req, res, next) => {
+app.get("/design/models/:name", async (req: Request, res: Response, next: NextFunction) => {
     try {
-        const ctx = (req as any).ctx;
-        const c = (await getClient()).db(DB).collection("models");
-        const out = await c.findOne({ tenantId: ctx.tenantId, name: req.params.name, active: true });
+        const ctx = (req as AuthedRequest).ctx;
+        const collection = (await getClient()).db(DB).collection("models");
+        const out = await collection.findOne({ tenantId: ctx.tenantId, name: req.params.name, active: true });
         if (!out) return res.status(404).end();
         res.json(out);
-    } catch (e) { next(e); }
+    } catch (error) {
+        next(error);
+    }
 });
 
-// ---- DATA: create + query (uses model.collection) ----
-app.post("/data/:model/create", async (req, res, next) => {
+app.post("/data/:model/create", async (req: Request, res: Response, next: NextFunction) => {
     try {
-        const ctx = (req as any).ctx;
+        const ctx = (req as AuthedRequest).ctx;
         const db = (await getClient()).db(DB);
         const models = db.collection("models");
-        const def = await models.findOne({ tenantId: ctx.tenantId, name: req.params.model, active: true });
+        const def = await models.findOne<{ collection: string; fields?: Array<{ name: string; required?: boolean }> }>({
+            tenantId: ctx.tenantId,
+            name: req.params.model,
+            active: true,
+        });
+
         if (!def) return res.status(404).send("Model not found");
 
-        const col = db.collection(def.collection);
+        const missing = (def.fields || [])
+            .filter((field) => field.required)
+            .map((field) => field.name)
+            .filter((fieldName) => !(fieldName in (req.body || {})));
+
+        if (missing.length) return res.status(422).json({ error: "Missing required fields", fields: missing });
+
         const now = new Date().toISOString();
         const doc = {
-            ...req.body,
+            ...(req.body || {}),
             tenantId: ctx.tenantId,
             createdAt: now,
             updatedAt: now,
             createdBy: ctx.user.id,
             updatedBy: ctx.user.id,
         };
-        const missing = (def.fields || [])
-            .filter(f => f.required)
-            .map(f => f.name)
-            .filter(name => !(name in req.body));
 
-        if (missing.length) return res.status(422).json({ error: "Missing required fields", fields: missing });
-        await col.insertOne(doc);
-        const events = (await getClient()).db(DB).collection('event_store');
-        await events.insertOne({
+        await db.collection(def.collection).insertOne(doc);
+        await db.collection("event_store").insertOne({
             tenantId: ctx.tenantId,
-            type: 'record.created',
-            model: req.params.model || 'ModelDef',
+            type: "record.created",
+            model: req.params.model,
             actor: ctx.user.id,
-            after: doc,                // the inserted doc
-            ts: new Date().toISOString(),
+            after: doc,
+            ts: now,
         });
+
         res.status(201).json({ ok: true });
-    } catch (e) { next(e); }
+    } catch (error) {
+        next(error);
+    }
 });
 
-app.post("/data/:model/query", async (req, res, next) => {
+app.post("/data/:model/query", async (req: Request, res: Response, next: NextFunction) => {
     try {
-        const ctx = (req as any).ctx;
-        const dbx = (await getClient()).db(DB);
-        const models = dbx.collection("models");
-        const def = await models.findOne({ tenantId: ctx.tenantId, name: req.params.model, active: true });
+        const ctx = (req as AuthedRequest).ctx;
+        const db = (await getClient()).db(DB);
+        const models = db.collection("models");
+        const def = await models.findOne<{ collection: string }>({
+            tenantId: ctx.tenantId,
+            name: req.params.model,
+            active: true,
+        });
+
         if (!def) return res.status(404).send("Model not found");
 
-        const col = dbx.collection(def.collection);
         const filter = req.body?.filter || {};
-        const rows = await col.find({ tenantId: ctx.tenantId, ...filter }).limit(100).toArray();
+        const rows = await db.collection(def.collection).find({ tenantId: ctx.tenantId, ...filter }).limit(100).toArray();
         res.json({ rows });
-    } catch (e) { next(e); }
+    } catch (error) {
+        next(error);
+    }
 });
 
-app.get('/__health', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+app.get("/__meta/models", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const ctx = (req as AuthedRequest).ctx;
+        const rows = await (await getClient())
+            .db(DB)
+            .collection("models")
+            .find({ tenantId: ctx.tenantId })
+            .project({ fields: 0 })
+            .toArray();
 
-app.get('/__meta/models', async (req, res) => {
-    const ctx = (req as any).ctx;
-    const c = (await getClient()).db(DB).collection('models');
-    res.json(await c.find({ tenantId: ctx.tenantId }).project({ fields: 0 }).toArray());
+        res.json(rows);
+    } catch (error) {
+        next(error);
+    }
 });
 
-app.get('/runtime/bootstrap', async (req, res) => {
-    const ctx = (req as any).ctx;
-    const dbx = (await getClient()).db(DB);
-    const [models, forms, actions, components] = await Promise.all([
-        dbx.collection('models').find({ tenantId: ctx.tenantId, active: true }).toArray(),
-        dbx.collection('forms').find({ tenantId: ctx.tenantId, active: true }).toArray(),
-        dbx.collection('actions').find({ tenantId: ctx.tenantId, active: true }).toArray(),
-        dbx.collection('components').find({ tenantId: ctx.tenantId, active: true }).toArray(),
-    ]);
-    const versionHash = require('crypto').createHash('sha1')
-        .update(JSON.stringify([models, forms, actions, components]))
-        .digest('hex');
-    res.set('ETag', versionHash).json({ versionHash, models, forms, actions, components });
+app.get("/runtime/bootstrap", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const ctx = (req as AuthedRequest).ctx;
+        const db = (await getClient()).db(DB);
+        const [models, forms, actions, components] = await Promise.all([
+            db.collection("models").find({ tenantId: ctx.tenantId, active: true }).toArray(),
+            db.collection("forms").find({ tenantId: ctx.tenantId, active: true }).toArray(),
+            db.collection("actions").find({ tenantId: ctx.tenantId, active: true }).toArray(),
+            db.collection("components").find({ tenantId: ctx.tenantId, active: true }).toArray(),
+        ]);
+
+        const versionHash = createHash("sha1")
+            .update(JSON.stringify([models, forms, actions, components]))
+            .digest("hex");
+
+        res.set("ETag", versionHash).json({
+            versionHash,
+            tenantId: ctx.tenantId,
+            models,
+            forms,
+            actions,
+            components,
+            features: {
+                crmOverview: true,
+                typedAiActions: true,
+                voice: true,
+            },
+        });
+    } catch (error) {
+        next(error);
+    }
 });
 
+app.use("/crm", crmRoutes(getClient, DB));
 app.use("/ai", aiRoutes(getClient, DB));
-
 app.use("/tts", ttsRoutes());
 
-const server = app.listen(PORT, () => console.log(`API (no-auth) on :${PORT}`));
+app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    console.error(err);
+    const message = err instanceof Error ? err.message : "Bad Request";
+    const status = message === "Missing Authorization" || message === "Invalid token" || message === "JWT_SECRET is not configured"
+        ? 401
+        : 400;
+
+    res.status(status).json({ error: message });
+});
+
+const server = app.listen(PORT, () => console.log(`API on :${PORT}`));
 function shutdown() {
     server.close(() => process.exit(0));
 }
 
-// Error handler (show stack in dev)
-app.use((err: any, _req: any, res: any, _next: any) => {
-    console.error(err);
-    res.status(400).json({ error: err.message || "Bad Request" });
-});
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

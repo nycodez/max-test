@@ -4,6 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "start": "pnpm dev",
+    "dev": "pnpm -r --parallel --filter @crm/api --filter @crm/runtime-ui dev",
     "dev:api": "pnpm --filter @crm/api dev",
     "dev:ui": "pnpm --filter @crm/runtime-ui dev",
     "build": "pnpm -r build",

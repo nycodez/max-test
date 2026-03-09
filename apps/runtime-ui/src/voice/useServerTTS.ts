@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 
-export function useElevenTTS(apiBase: string) {
+export function useServerTTS(apiBase: string) {
     const audioRef = useRef<HTMLAudioElement | null>(null);
     const urlRef = useRef<string | null>(null);
     const fetchAbort = useRef<AbortController | null>(null);
@@ -10,7 +10,9 @@ export function useElevenTTS(apiBase: string) {
         try {
             audioRef.current?.pause();
             if (urlRef.current) URL.revokeObjectURL(urlRef.current);
-        } catch {}
+        } catch {
+            // No-op cleanup path.
+        }
         audioRef.current = null;
         urlRef.current = null;
         fetchAbort.current?.abort();
@@ -23,29 +25,38 @@ export function useElevenTTS(apiBase: string) {
     }, [cleanup]);
 
     const say = useCallback(async (text: string, opts?: {
-        voiceId?: string;
-        modelId?: string;
-        voice_settings?: { stability?: number; similarity_boost?: number; style?: number; use_speaker_boost?: boolean };
+        voice?: string;
+        rate?: number;
+        pitch?: number;
+        allowFallback?: boolean;
     }) => {
-        cleanup(); // stop anything in-flight
+        cleanup();
         setSpeaking(true);
 
         const ac = new AbortController();
         fetchAbort.current = ac;
 
-        const r = await fetch(`${apiBase}/tts/native`, {
+        const response = await fetch(`${apiBase}/tts/speak`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text, ...opts }),
+            body: JSON.stringify({
+                text,
+                provider: "google",
+                allowFallback: opts?.allowFallback ?? true,
+                voice: opts?.voice,
+                rate: opts?.rate,
+                pitch: opts?.pitch,
+            }),
             signal: ac.signal,
         });
-        if (!r.ok) {
+
+        if (!response.ok) {
             setSpeaking(false);
-            const err = await r.json().catch(() => ({}));
+            const err = await response.json().catch(() => ({}));
             throw new Error(err?.error || "TTS request failed");
         }
 
-        const blob = await r.blob();
+        const blob = await response.blob();
         const url = URL.createObjectURL(blob);
         urlRef.current = url;
 
@@ -54,11 +65,10 @@ export function useElevenTTS(apiBase: string) {
 
         return new Promise<void>((resolve, reject) => {
             const done = () => { cleanup(); resolve(); };
-            const fail = (e: any) => { cleanup(); reject(e); };
+            const fail = (error: unknown) => { cleanup(); reject(error); };
 
             audio.addEventListener("ended", done, { once: true });
             audio.addEventListener("error", fail, { once: true });
-
             audio.play().catch(fail);
         });
     }, [apiBase, cleanup]);

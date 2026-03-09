@@ -1,0 +1,122 @@
+{
+  "version": 1,
+  "abilities": [
+    {
+      "id": "crm_core",
+      "label": "CRM Operations",
+      "description": "create and list contacts, companies, and tasks",
+      "enabled": true
+    },
+    {
+      "id": "weather_live",
+      "label": "Live Weather",
+      "description": "answer live weather questions by city",
+      "enabled": true
+    },
+    {
+      "id": "time_lookup",
+      "label": "Time Lookup",
+      "description": "answer current time questions by city or timezone",
+      "enabled": true
+    }
+  ],
+  "tools": [
+    {
+      "id": "weather_current",
+      "label": "Current Weather",
+      "description": "Get current weather using Open-Meteo",
+      "enabled": true,
+      "triggers": ["weather", "temperature", "forecast", "rain", "sunny", "cloudy", "wind"],
+      "access": {
+        "method": "local.weather_open_meteo",
+        "defaultLocation": "Austin, Texas"
+      }
+    },
+    {
+      "id": "time_current",
+      "label": "Current Time",
+      "description": "Get current time for a place",
+      "enabled": true,
+      "triggers": ["what time", "current time", "time in", "time now"],
+      "access": {
+        "method": "local.time_lookup",
+        "defaultTimezone": "America/Chicago",
+        "defaultLocationLabel": "Austin, Texas",
+        "cityTimezones": {
+          "austin": "America/Chicago",
+          "austin texas": "America/Chicago",
+          "new york": "America/New_York",
+          "los angeles": "America/Los_Angeles",
+          "san francisco": "America/Los_Angeles",
+          "chicago": "America/Chicago",
+          "dallas": "America/Chicago",
+          "london": "Europe/London",
+          "paris": "Europe/Paris",
+          "kuala lumpur": "Asia/Kuala_Lumpur",
+          "singapore": "Asia/Singapore",
+          "tokyo": "Asia/Tokyo"
+        }
+      }
+    },
+    {
+      "id": "crm_create_contact",
+      "label": "Create Contact",
+      "description": "Create a CRM contact record",
+      "enabled": true,
+      "triggers": ["create contact", "add contact", "new contact"],
+      "access": {
+        "method": "crm.create_contact"
+      }
+    },
+    {
+      "id": "crm_create_company",
+      "label": "Create Company",
+      "description": "Create a CRM company record",
+      "enabled": true,
+      "triggers": ["create company", "add company", "new company"],
+      "access": {
+        "method": "crm.create_company"
+      }
+    },
+    {
+      "id": "crm_create_task",
+      "label": "Create Task",
+      "description": "Create a CRM task record",
+      "enabled": true,
+      "triggers": ["create task", "add task", "new task", "create follow up"],
+      "access": {
+        "method": "crm.create_task"
+      }
+    },
+    {
+      "id": "crm_list_contacts",
+      "label": "List Contacts",
+      "description": "List CRM contacts",
+      "enabled": true,
+      "triggers": ["list contacts", "show contacts", "find contacts", "search contacts"],
+      "access": {
+        "method": "crm.list_contacts"
+      }
+    },
+    {
+      "id": "crm_list_companies",
+      "label": "List Companies",
+      "description": "List CRM companies",
+      "enabled": true,
+      "triggers": ["list companies", "show companies", "find companies", "search companies"],
+      "access": {
+        "method": "crm.list_companies"
+      }
+    },
+    {
+      "id": "crm_list_tasks",
+      "label": "List Tasks",
+      "description": "List CRM tasks",
+      "enabled": true,
+      "triggers": ["list tasks", "show tasks", "find tasks", "search tasks"],
+      "access": {
+        "method": "crm.list_tasks"
+      }
+    }
+  ]
+}
