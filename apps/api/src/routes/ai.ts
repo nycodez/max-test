@@ -18,6 +18,7 @@ import {
     matchAgentToolByText,
     type AgentToolAccess,
 } from "../agentTools";
+import { tryLocalInferenceJson } from "../localInference";
 import { getLocalRouterStatus, tryLocalRouterPlan, type LocalIntent, type LocalRouterPlan } from "../localRouter";
 import { getVertexStatus, tryGenerateGeminiText } from "../vertex";
 
@@ -37,6 +38,18 @@ type SessionDoc = {
 type AssistantPlan = {
     replyText: string;
     action: AssistantAction;
+};
+
+type GatewayMemory = {
+    tenantId: string;
+    threadId: string;
+    mode?: "off" | "read_only" | "write_only" | "read_write";
+    useCache?: boolean;
+};
+
+type GatewayRoute = {
+    kind: "time_lookup" | "weather_lookup" | "crm_action" | "general_reply" | "conversation_recap" | "refuse";
+    location?: string;
 };
 
 type ChatTurnResult = {
@@ -323,6 +336,295 @@ function buildFallbackReply(action: AssistantAction): string {
     }
 }
 
+function spokenStyleInstruction(): string {
+    return [
+        "Write for spoken conversation, not for reading on a screen.",
+        "Spell out units and short forms when practical.",
+        "Avoid abbreviations like F, mph, and a.m. or p.m.",
+        "Do not use parentheses, numbered lists, or decorative punctuation.",
+        "Keep the wording natural and easy to say aloud.",
+    ].join(" ");
+}
+
+function normalizeGatewayRoute(input: unknown): GatewayRoute {
+    if (!input || typeof input !== "object") return { kind: "general_reply" };
+    const source = input as Record<string, unknown>;
+    const kind = typeof source.kind === "string" ? source.kind.trim() : "";
+    if (
+        kind !== "time_lookup"
+        && kind !== "weather_lookup"
+        && kind !== "crm_action"
+        && kind !== "general_reply"
+        && kind !== "conversation_recap"
+        && kind !== "refuse"
+    ) {
+        return { kind: "general_reply" };
+    }
+
+    const location = typeof source.location === "string" && source.location.trim()
+        ? source.location.trim()
+        : undefined;
+    return { kind, location };
+}
+
+function compactConversation(messages: Msg[], limit: number, maxChars: number): Array<{ role: "user" | "model"; text: string }> {
+    return messages
+        .slice(-limit)
+        .map((message) => ({
+            role: message.role,
+            text: message.text.replace(/\s+/g, " ").trim().slice(0, maxChars),
+        }));
+}
+
+function summarizeRecentUserTurns(history: Msg[], currentText: string): string {
+    const normalizedCurrent = normalizeForCompare(currentText);
+    const userTurns = history
+        .filter((message) => message.role === "user" && message.text.trim())
+        .map((message) => message.text.replace(/\s+/g, " ").trim());
+
+    const priorTurns = userTurns.length && normalizeForCompare(userTurns[userTurns.length - 1]) === normalizedCurrent
+        ? userTurns.slice(0, -1)
+        : userTurns;
+
+    const recentTurns = priorTurns
+        .filter((turn, index, all) => index === 0 || normalizeForCompare(turn) !== normalizeForCompare(all[index - 1]))
+        .slice(-4);
+
+    if (!recentTurns.length) {
+        return "You have not asked any earlier questions in this thread yet.";
+    }
+
+    if (recentTurns.length === 1) {
+        return `Your previous question was: ${recentTurns[0]}.`;
+    }
+
+    if (recentTurns.length === 2) {
+        return `Your last two questions were: ${recentTurns[0]}. Then ${recentTurns[1]}.`;
+    }
+
+    const leadTurns = recentTurns.slice(0, -1).join(". Then ");
+    const finalTurn = recentTurns[recentTurns.length - 1];
+    return `Your last ${recentTurns.length} questions were: ${leadTurns}. And then ${finalTurn}.`;
+}
+
+async function routeAssistantTurnViaLocalInference(traceId: string, text: string, history: Msg[], _memory?: GatewayMemory): Promise<GatewayRoute | null> {
+    const route = await tryLocalInferenceJson<{ route?: unknown }>({
+        traceId,
+        purpose: "assistant_route",
+        system: [
+            "You are a strict router for an AI CRM assistant.",
+            "Route the user request into exactly one kind.",
+            "Allowed kinds: time_lookup, weather_lookup, crm_action, general_reply, conversation_recap, refuse.",
+            "Use time_lookup only for current time/date questions.",
+            "Use weather_lookup only for current weather/temperature/forecast questions.",
+            "Use crm_action only for CRM operations on contacts, companies, or tasks.",
+            "Use conversation_recap when the user asks what they asked earlier or asks for a recap of recent questions.",
+            "Use refuse for dangerous, illegal, or disallowed assistance.",
+            "Use general_reply for everything else.",
+            spokenStyleInstruction(),
+            "Return JSON only and never answer the question directly.",
+        ].join(" "),
+        prompt: [
+            "Recent conversation:",
+            JSON.stringify(compactConversation(history, 6, 120)),
+            "User request:",
+            text,
+        ].join("\n"),
+        schema: {
+            type: "object",
+            additionalProperties: false,
+            required: ["route"],
+            properties: {
+                route: {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["kind"],
+                    properties: {
+                        kind: {
+                            type: "string",
+                            enum: ["time_lookup", "weather_lookup", "crm_action", "general_reply", "conversation_recap", "refuse"],
+                        },
+                        location: { type: "string" },
+                    },
+                },
+            },
+        },
+        temperature: 0,
+    });
+
+    if (!route) return null;
+    return normalizeGatewayRoute(route.route);
+}
+
+async function planCrmActionFromLocalInference(
+    traceId: string,
+    text: string,
+    history: Msg[],
+    overview: CrmOverview,
+    _memory?: GatewayMemory,
+): Promise<AssistantPlan | null> {
+    const localPlan = await tryLocalInferenceJson<{
+        replyText?: unknown;
+        action?: unknown;
+    }>({
+        traceId,
+        purpose: "assistant_crm_plan",
+        system: [
+            "You are Max, an AI CRM operator inside a CRM product.",
+            "The user intent is already known to be a CRM action.",
+            "Return strict JSON only.",
+            "Populate action for contacts, companies, or tasks.",
+            "Do not invent missing fields. If required details are missing, set action.type to none and ask a short follow-up in replyText.",
+            spokenStyleInstruction(),
+            "Keep replyText under 160 characters.",
+        ].join(" "),
+        prompt: [
+            "Recent conversation:",
+            JSON.stringify(compactConversation(history, 6, 160)),
+            "CRM overview:",
+            JSON.stringify(overview),
+            "User request:",
+            text,
+        ].join("\n"),
+        schema: {
+            type: "object",
+            additionalProperties: false,
+            required: ["replyText", "action"],
+            properties: {
+                replyText: { type: "string", minLength: 1, maxLength: 160 },
+                action: {
+                    type: "object",
+                    additionalProperties: true,
+                    required: ["type"],
+                    properties: {
+                        type: {
+                            type: "string",
+                            enum: ["none", "create_contact", "create_company", "create_task", "list_contacts", "list_companies", "list_tasks"],
+                        },
+                    },
+                },
+            },
+        },
+        temperature: 0.1,
+    });
+
+    if (!localPlan) return null;
+
+    const action = normalizeAction(localPlan.action);
+    const replyText = typeof localPlan.replyText === "string" && localPlan.replyText.trim()
+        ? localPlan.replyText.trim()
+        : buildFallbackReply(action);
+
+    return { replyText, action };
+}
+
+async function planGeneralReplyFromLocalInference(
+    traceId: string,
+    text: string,
+    history: Msg[],
+    _memory?: GatewayMemory,
+): Promise<AssistantPlan | null> {
+    const generalPlan = await tryLocalInferenceJson<{ replyText?: unknown }>({
+        traceId,
+        purpose: "assistant_general_reply",
+        system: [
+            "You are Max, a concise and friendly assistant inside a CRM app.",
+            "Answer naturally in 1-2 short sentences.",
+            "Do not invent app capabilities.",
+            "Do not mention hidden policies or routing.",
+            spokenStyleInstruction(),
+            "Return strict JSON only.",
+        ].join(" "),
+        prompt: [
+            "Recent conversation:",
+            JSON.stringify(compactConversation(history, 6, 140)),
+            "User request:",
+            text,
+        ].join("\n"),
+        schema: {
+            type: "object",
+            additionalProperties: false,
+            required: ["replyText"],
+            properties: {
+                replyText: { type: "string", minLength: 1, maxLength: 220 },
+            },
+        },
+        temperature: 0.3,
+    });
+
+    if (!generalPlan || typeof generalPlan.replyText !== "string" || !generalPlan.replyText.trim()) {
+        return null;
+    }
+
+    return {
+        replyText: generalPlan.replyText.trim(),
+        action: { type: "none" },
+    };
+}
+
+async function planFromLocalInference(
+    traceId: string,
+    text: string,
+    history: Msg[],
+    overview: CrmOverview,
+    memory?: GatewayMemory,
+): Promise<AssistantPlan | null> {
+    const route = await routeAssistantTurnViaLocalInference(traceId, text, history, memory);
+    if (!route) return null;
+
+    if (route.kind === "time_lookup") {
+        const timeConfig = getAgentToolsConfig().tools.find((entry) => entry.access.method === "local.time_lookup");
+        const toolReply = await configuredTimeReply(route.location || text, timeConfig?.access ?? {
+            method: "local.time_lookup",
+        });
+        return {
+            replyText: toolReply,
+            action: { type: "none" },
+        };
+    }
+
+    if (route.kind === "weather_lookup") {
+        const weatherConfig = getAgentToolsConfig().tools.find((entry) => entry.access.method === "local.weather_open_meteo");
+        const place = route.location || extractWeatherPlace(text) || weatherConfig?.access.defaultLocation || "Austin, Texas";
+        const weatherReply = await fetchLiveWeatherReply(place);
+        return {
+            replyText: weatherReply || `I could not fetch live weather for ${place} right now.`,
+            action: { type: "none" },
+        };
+    }
+
+    if (route.kind === "conversation_recap") {
+        return {
+            replyText: summarizeRecentUserTurns(history, text),
+            action: { type: "none" },
+        };
+    }
+
+    if (route.kind === "refuse") {
+        return {
+            replyText: "I cannot help with that request.",
+            action: { type: "none" },
+        };
+    }
+
+    if (route.kind === "crm_action") {
+        const crmPlan = await planCrmActionFromLocalInference(traceId, text, history, overview, memory);
+        if (crmPlan) return crmPlan;
+        return null;
+    }
+
+    if (route.kind === "general_reply") {
+        const generalPlan = await planGeneralReplyFromLocalInference(traceId, text, history, memory);
+        if (generalPlan) return generalPlan;
+        return {
+            replyText: "I am not fully sure, but ask me again in one short sentence.",
+            action: { type: "none" },
+        };
+    }
+
+    return null;
+}
+
 function isGreeting(text: string): boolean {
     const normalized = text
         .trim()
@@ -461,6 +763,7 @@ function buildGeneralPrompt(text: string, recentConversation: Array<{ role: "use
         "Answer the user naturally in 1-2 short sentences.",
         "Do not invent app capabilities.",
         "If the question is outside CRM, answer it directly when possible.",
+        spokenStyleInstruction(),
         "No JSON. No markdown list. Plain text only.",
         "Recent conversation:",
         JSON.stringify(recentConversation),
@@ -491,15 +794,16 @@ function austinTimeReply(text: string): string | null {
     const now = new Date();
     const formatted = new Intl.DateTimeFormat("en-US", {
         timeZone: "America/Chicago",
-        weekday: "short",
-        month: "short",
+        weekday: "long",
+        month: "long",
         day: "numeric",
         year: "numeric",
         hour: "numeric",
         minute: "2-digit",
+        hour12: true,
     }).format(now);
 
-    return `In Austin, Texas (Central Time), it is ${formatted}.`;
+    return `In Austin, Texas, it is ${formatted}.`;
 }
 
 function extractWeatherPlace(text: string): string | null {
@@ -609,11 +913,11 @@ async function fetchLiveWeatherReply(place: string): Promise<string | null> {
         const wind = Number.isFinite(current.wind_speed_10m) ? Math.round(current.wind_speed_10m as number) : null;
         const weather = Number.isFinite(current.weather_code) ? weatherCodeText(current.weather_code as number) : "mixed conditions";
 
-        const tempText = temp !== null ? `${temp}F` : "n/a";
-        const feelsText = feels !== null ? `${feels}F` : "n/a";
-        const windText = wind !== null ? `${wind} mph` : "n/a";
+        const tempText = temp !== null ? `${temp} degrees Fahrenheit` : "temperature unavailable";
+        const feelsText = feels !== null ? `${feels} degrees Fahrenheit` : "feels like unavailable";
+        const windText = wind !== null ? `${wind} miles per hour` : "wind speed unavailable";
 
-        return `Current weather in ${location}: ${tempText}, feels like ${feelsText}, ${weather}, wind ${windText}.`;
+        return `Current weather in ${location}: ${tempText}, feels like ${feelsText}, ${weather}, with wind at ${windText}.`;
     } catch {
         return null;
     } finally {
@@ -626,12 +930,13 @@ function tryFormatTimeForZone(timeZone: string, label: string): string | null {
         const now = new Date();
         const formatted = new Intl.DateTimeFormat("en-US", {
             timeZone,
-            weekday: "short",
-            month: "short",
+            weekday: "long",
+            month: "long",
             day: "numeric",
             year: "numeric",
             hour: "numeric",
             minute: "2-digit",
+            hour12: true,
         }).format(now);
         return `In ${label}, it is ${formatted}.`;
     } catch {
@@ -639,10 +944,55 @@ function tryFormatTimeForZone(timeZone: string, label: string): string | null {
     }
 }
 
-function configuredTimeReply(text: string, access: AgentToolAccess): string {
+function extractTimePlace(text: string): string | null {
+    const normalized = text.replace(/\s+/g, " ").trim();
+    if (!normalized) return null;
+
+    const directMatch = normalized.match(/\b(?:time|date)\s+(?:in|for|at)\s+([A-Za-z0-9.' -]+)$/i);
+    const questionMatch = normalized.match(/\b(?:what(?:'s| is)?|current)\s+(?:the\s+)?time\s+(?:in|for|at)\s+([A-Za-z0-9.' -]+)$/i);
+    const place = directMatch?.[1] || questionMatch?.[1];
+    if (!place) return null;
+
+    return place.replace(/[?.!,]+$/g, "").trim() || null;
+}
+
+async function fetchLiveTimeReply(place: string): Promise<string | null> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 7000);
+
+    try {
+        const response = await fetch(
+            `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(place)}&count=1&language=en&format=json`,
+            { signal: controller.signal },
+        );
+        if (!response.ok) return null;
+
+        const payload = await response.json() as {
+            results?: Array<{
+                name: string;
+                admin1?: string;
+                country?: string;
+                timezone?: string;
+            }>;
+        };
+
+        const hit = payload.results?.[0];
+        if (!hit?.timezone) return null;
+
+        const label = [hit.name, hit.admin1, hit.country].filter(Boolean).join(", ");
+        return tryFormatTimeForZone(hit.timezone, label || place);
+    } catch {
+        return null;
+    } finally {
+        clearTimeout(timeoutId);
+    }
+}
+
+async function configuredTimeReply(text: string, access: AgentToolAccess): Promise<string> {
     const normalized = normalizeForCompare(text);
     const timezoneMap = access.cityTimezones || {};
     const keys = Object.keys(timezoneMap).sort((left, right) => right.length - left.length);
+    const requestedPlace = extractTimePlace(text);
 
     for (const key of keys) {
         if (!normalized.includes(key)) continue;
@@ -650,6 +1000,12 @@ function configuredTimeReply(text: string, access: AgentToolAccess): string {
         const label = key.split(" ").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" ");
         const reply = tryFormatTimeForZone(timezone, label);
         if (reply) return reply;
+    }
+
+    if (requestedPlace) {
+        const liveReply = await fetchLiveTimeReply(requestedPlace);
+        if (liveReply) return liveReply;
+        return `I could not resolve a timezone for ${requestedPlace}.`;
     }
 
     const fallbackReply = tryFormatTimeForZone(
@@ -689,7 +1045,7 @@ async function planFromConfiguredTool(traceId: string, text: string): Promise<As
         }
         case "local.time_lookup":
             return {
-                replyText: configuredTimeReply(text, tool.access),
+                replyText: await configuredTimeReply(text, tool.access),
                 action: { type: "none" },
             };
         case "crm.list_contacts":
@@ -1051,7 +1407,13 @@ function heuristicPlan(text: string, vertexEnabled: boolean): AssistantPlan {
     };
 }
 
-async function planAssistantTurn(traceId: string, text: string, history: Msg[], overview: CrmOverview): Promise<AssistantPlan> {
+async function planAssistantTurn(
+    traceId: string,
+    text: string,
+    history: Msg[],
+    overview: CrmOverview,
+    memory?: GatewayMemory,
+): Promise<AssistantPlan> {
     const vertexEnabled = getVertexStatus().enabled;
     const recentConversation = history.slice(-8).map((message) => ({
         role: message.role,
@@ -1074,33 +1436,13 @@ async function planAssistantTurn(traceId: string, text: string, history: Msg[], 
         };
     }
 
-    const configuredToolPlan = await planFromConfiguredTool(traceId, text);
-    if (configuredToolPlan) {
-        traceLog(traceId, "plan.config_tool.selected", {
-            action: summarizeAction(configuredToolPlan.action),
-            replyText: previewText(configuredToolPlan.replyText, 90),
+    const localInferencePlan = await planFromLocalInference(traceId, text, history, overview, memory);
+    if (localInferencePlan) {
+        traceLog(traceId, "plan.local_inference.selected", {
+            action: summarizeAction(localInferencePlan.action),
+            replyText: previewText(localInferencePlan.replyText, 90),
         });
-        return configuredToolPlan;
-    }
-
-    if (isDeterministicCrmCommand(text)) {
-        const deterministicPlan = heuristicPlan(text, vertexEnabled);
-        if (deterministicPlan.action.type !== "none") {
-            traceLog(traceId, "plan.deterministic_crm.selected", {
-                action: summarizeAction(deterministicPlan.action),
-                replyText: previewText(deterministicPlan.replyText, 90),
-            });
-            return deterministicPlan;
-        }
-    }
-
-    if (isDeterministicMetaQuestion(text)) {
-        const metaPlan = heuristicPlan(text, vertexEnabled);
-        traceLog(traceId, "plan.deterministic_meta.selected", {
-            action: summarizeAction(metaPlan.action),
-            replyText: previewText(metaPlan.replyText, 90),
-        });
-        return metaPlan;
+        return localInferencePlan;
     }
 
     const likelyGeneralQuestion = isLikelyGeneralQuestion(text);
@@ -1164,39 +1506,41 @@ async function planAssistantTurn(traceId: string, text: string, history: Msg[], 
         traceLog(traceId, "plan.local_router.miss");
     }
 
+    const configuredToolPlan = await planFromConfiguredTool(traceId, text);
+    if (configuredToolPlan) {
+        traceLog(traceId, "plan.config_tool.selected", {
+            action: summarizeAction(configuredToolPlan.action),
+            replyText: previewText(configuredToolPlan.replyText, 90),
+        });
+        return configuredToolPlan;
+    }
+
+    if (isDeterministicCrmCommand(text)) {
+        const deterministicPlan = heuristicPlan(text, vertexEnabled);
+        if (deterministicPlan.action.type !== "none") {
+            traceLog(traceId, "plan.deterministic_crm.selected", {
+                action: summarizeAction(deterministicPlan.action),
+                replyText: previewText(deterministicPlan.replyText, 90),
+            });
+            return deterministicPlan;
+        }
+    }
+
+    if (isDeterministicMetaQuestion(text)) {
+        const metaPlan = heuristicPlan(text, vertexEnabled);
+        traceLog(traceId, "plan.deterministic_meta.selected", {
+            action: summarizeAction(metaPlan.action),
+            replyText: previewText(metaPlan.replyText, 90),
+        });
+        return metaPlan;
+    }
+
     const generalPlan = await maybePlanGeneralAnswer("post_local_router");
     if (generalPlan) return generalPlan;
 
-    const prompt = [
-        "You are Max, an AI CRM operator for a focused MVP.",
-        "Return exactly one JSON object and nothing else.",
-        "Schema:",
-        JSON.stringify({
-            replyText: "Short helpful response in plain English.",
-            action: {
-                type: "one of none | create_contact | create_company | create_task | list_contacts | list_companies | list_tasks",
-            },
-        }),
-        "Rules:",
-        "- Only choose actions that are supported by the schema.",
-        "- Prefer list actions when the user asks to show, list, find, or search records.",
-        "- Prefer create actions when the user asks to add or create a record.",
-        "- If the user request is ambiguous or missing required details, use action type 'none' and ask a short follow-up question.",
-        "- Do not mention unsupported features like dynamic models, forms, images, or YouTube.",
-        "- Keep replyText under 160 characters.",
-        "Enabled tool catalog:",
-        JSON.stringify(getEnabledToolsForPrompt(getAgentToolsConfig())),
-        "CRM snapshot:",
-        JSON.stringify(overview),
-        "Recent conversation:",
-        JSON.stringify(recentConversation),
-        "User request:",
-        text,
-    ].join("\n");
-
     try {
         traceLog(traceId, "plan.vertex.attempt");
-        const rawText = await tryGenerateGeminiText(prompt, traceId);
+        const rawText = await tryGenerateGeminiText(buildGeneralPrompt(text, recentConversation), traceId);
         if (!rawText) {
             traceLog(traceId, "plan.vertex.empty_fallback_heuristic");
             const plan = heuristicPlan(text, vertexEnabled);
@@ -1220,18 +1564,12 @@ async function planAssistantTurn(traceId: string, text: string, history: Msg[], 
             return plan;
         }
 
-        const parsed = JSON.parse(jsonText) as { replyText?: unknown; action?: unknown };
-        const action = normalizeAction(parsed.action);
-        const replyText = typeof parsed.replyText === "string" && parsed.replyText.trim()
-            ? parsed.replyText.trim()
-            : buildFallbackReply(action);
-
         traceLog(traceId, "plan.vertex.selected", {
-            action: summarizeAction(action),
-            replyText: previewText(replyText, 90),
+            action: "none",
+            replyText: previewText(cleanGeneralReply(rawText), 90),
         });
 
-        return { replyText, action };
+        return { replyText: cleanGeneralReply(rawText), action: { type: "none" } };
     } catch (error) {
         traceError(traceId, "plan.vertex.error_fallback_heuristic", error);
         const plan = heuristicPlan(text, false);
@@ -1315,7 +1653,12 @@ async function runChatTurn(
         historyMessages: history.length,
     });
     const overviewBefore = await getOverview(db, ctx);
-    const plan = await planAssistantTurn(traceId, text, history, overviewBefore);
+    const plan = await planAssistantTurn(traceId, text, history, overviewBefore, {
+        tenantId: ctx.tenantId,
+        threadId,
+        mode: "read_write",
+        useCache: true,
+    });
     traceLog(traceId, "turn.plan.selected", {
         threadId,
         action: summarizeAction(plan.action),

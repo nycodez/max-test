@@ -1,3 +1,5 @@
+import { getLocalInferenceStatus, tryLocalInferenceJson } from "./localInference";
+
 export const SUPPORTED_INTENTS = [
     "greeting",
     "capabilities",
@@ -26,52 +28,6 @@ export type LocalRouterStatus = {
     reason?: string;
 };
 
-function env(name: string, fallback?: string): string | undefined {
-    const value = process.env[name] ?? fallback;
-    return value?.trim() ? value : undefined;
-}
-
-function envFlag(name: string, fallback: boolean): boolean {
-    const raw = env(name);
-    if (!raw) return fallback;
-    const normalized = raw.replace(/^['"]|['"]$/g, "").trim().toLowerCase();
-    if (["false", "0", "off", "no", "disabled"].includes(normalized)) return false;
-    if (["true", "1", "on", "yes", "enabled"].includes(normalized)) return true;
-    return fallback;
-}
-
-function extractJsonObject(raw: string): string | null {
-    const trimmed = raw.trim().replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
-    const start = trimmed.indexOf("{");
-    if (start < 0) return null;
-
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    for (let index = start; index < trimmed.length; index += 1) {
-        const char = trimmed[index];
-        if (escaped) {
-            escaped = false;
-            continue;
-        }
-        if (char === "\\") {
-            escaped = true;
-            continue;
-        }
-        if (char === "\"") {
-            inString = !inString;
-            continue;
-        }
-        if (inString) continue;
-        if (char === "{") depth += 1;
-        if (char === "}") {
-            depth -= 1;
-            if (depth === 0) return trimmed.slice(start, index + 1);
-        }
-    }
-    return null;
-}
-
 function normalizeIntent(value: unknown): LocalIntent {
     const intent = String(value || "").trim().toLowerCase();
     return (SUPPORTED_INTENTS as readonly string[]).includes(intent) ? (intent as LocalIntent) : "unknown";
@@ -96,15 +52,6 @@ function normalizeAlternatives(value: unknown): LocalIntent[] {
         .slice(0, 5);
 }
 
-function getRouterConfig() {
-    return {
-        enabled: envFlag("LOCAL_ROUTER_ENABLED", false),
-        url: env("LOCAL_ROUTER_URL", "http://wtf.local:11434"),
-        model: env("LOCAL_ROUTER_MODEL", "qwen3.5:2b"),
-        timeoutMs: Math.max(500, Number(env("LOCAL_ROUTER_TIMEOUT_MS", "12000")) || 12000),
-    };
-}
-
 function traceLogsEnabled(): boolean {
     const raw = String(process.env.AI_TRACE_LOGS ?? "true").trim().toLowerCase();
     return !["0", "false", "off", "no", "disabled"].includes(raw);
@@ -118,11 +65,7 @@ function traceLocalRouter(traceId: string | undefined, stage: string, payload?: 
 }
 
 export function getLocalRouterStatus(): LocalRouterStatus {
-    const config = getRouterConfig();
-    if (!config.enabled) return { enabled: false, reason: "LOCAL_ROUTER_ENABLED=false" };
-    if (!config.url) return { enabled: false, reason: "LOCAL_ROUTER_URL is not set" };
-    if (!config.model) return { enabled: false, reason: "LOCAL_ROUTER_MODEL is not set" };
-    return { enabled: true };
+    return getLocalInferenceStatus();
 }
 
 function buildPrompt(params: {
@@ -204,84 +147,46 @@ export async function tryLocalRouterPlan(params: {
         return null;
     }
 
-    const config = getRouterConfig();
-    if (!config.url || !config.model) {
-        traceLocalRouter(params.traceId, "skip.invalid_config", {
-            hasUrl: Boolean(config.url),
-            hasModel: Boolean(config.model),
-        });
-        return null;
-    }
+    const schema = {
+        type: "object",
+        additionalProperties: false,
+        required: ["intent", "confidence", "entities", "alternatives"],
+        properties: {
+            intent: { type: "string", enum: [...SUPPORTED_INTENTS] },
+            confidence: { type: "number", minimum: 0, maximum: 1 },
+            entities: { type: "object", additionalProperties: true },
+            alternatives: {
+                type: "array",
+                items: { type: "string", enum: [...SUPPORTED_INTENTS] },
+                maxItems: 5,
+            },
+        },
+    } satisfies Record<string, unknown>;
 
-    const startedAt = Date.now();
-    traceLocalRouter(params.traceId, "request.start", {
-        model: config.model,
-        url: config.url,
-        timeoutMs: config.timeoutMs,
+    const localResult = await tryLocalInferenceJson<Record<string, unknown>>({
+        traceId: params.traceId,
+        purpose: "local_router_plan",
+        system: "You are an intent classifier for a CRM assistant. Return strict JSON only.",
+        prompt: buildPrompt(params),
+        schema,
+        temperature: 0,
     });
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), config.timeoutMs);
-
-    try {
-        const response = await fetch(`${config.url.replace(/\/+$/, "")}/api/generate`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                model: config.model,
-                prompt: buildPrompt(params),
-                stream: false,
-                format: "json",
-                options: {
-                    temperature: 0,
-                },
-            }),
-            signal: controller.signal,
-        });
-
-        if (!response.ok) {
-            traceLocalRouter(params.traceId, "request.http_error", {
-                status: response.status,
-                statusText: response.statusText,
-                durationMs: Date.now() - startedAt,
-            });
-            return null;
-        }
-        const payload = await response.json() as { response?: string; thinking?: string };
-        const responseText = String(payload.response || "").trim();
-        const thinkingText = String(payload.thinking || "").trim();
-        const rawText = responseText || thinkingText;
-        if (!rawText) {
-            traceLocalRouter(params.traceId, "request.empty_response", {
-                durationMs: Date.now() - startedAt,
-            });
-            return null;
-        }
-
-        const jsonText = extractJsonObject(rawText) || rawText;
-        const parsed = JSON.parse(jsonText) as Record<string, unknown>;
-        const plan = {
-            intent: normalizeIntent(parsed.intent),
-            confidence: normalizeConfidence(parsed.confidence),
-            entities: normalizeEntities(parsed.entities),
-            alternatives: normalizeAlternatives(parsed.alternatives),
-        };
-        traceLocalRouter(params.traceId, "request.success", {
-            intent: plan.intent,
-            confidence: plan.confidence,
-            alternatives: plan.alternatives,
-            source: responseText ? "response" : "thinking",
-            durationMs: Date.now() - startedAt,
-        });
-        return plan;
-    } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        traceLocalRouter(params.traceId, "request.error", {
-            message,
-            durationMs: Date.now() - startedAt,
-        });
+    if (!localResult) {
         return null;
-    } finally {
-        clearTimeout(timeoutId);
     }
+
+    const plan = {
+        intent: normalizeIntent(localResult.intent),
+        confidence: normalizeConfidence(localResult.confidence),
+        entities: normalizeEntities(localResult.entities),
+        alternatives: normalizeAlternatives(localResult.alternatives),
+    };
+    traceLocalRouter(params.traceId, "request.success", {
+        intent: plan.intent,
+        confidence: plan.confidence,
+        alternatives: plan.alternatives,
+        source: "local_inference",
+    });
+    return plan;
 }

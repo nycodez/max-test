@@ -21,8 +21,6 @@ export default function VoiceController({
                                         }: VoiceControllerProps) {
     const API = (import.meta as any).env?.VITE_API_URL || "http://localhost:8080";
     const tts = useServerTTS(API);
-    const sttEnabled = enabled && !tts.speaking;
-    const stt = useSpeechToText(sttEnabled);
 
     const { level } = useMicLevel(enabled);
     const transcript = useTranscript();
@@ -47,14 +45,57 @@ export default function VoiceController({
     const SUSTAIN_MS = 180;
     const COOLDOWN_MS = 180;
     const TTS_GRACE_MS = 900;
-    const POST_TTS_STT_DELAY_MS = 200;
+    const POST_TTS_STT_DELAY_MS = 1200;
+    const TTS_ECHO_REJECT_MS = 5000;
 
     const [userTalking, setUserTalking] = useState(false);
+    const [sttBlockedUntil, setSttBlockedUntil] = useState(0);
     const lastTtsStartRef = useRef<number>(0);
+    const lastTtsEndRef = useRef<number>(0);
+    const lastAssistantReplyRef = useRef("");
     const hotAccumRef = useRef<number>(0);
     const coolAccumRef = useRef<number>(0);
     const lastFrameRef = useRef<number>(performance.now());
     const emaRef = useRef<number>(0);
+    const sttBlockTimerRef = useRef<number | null>(null);
+
+    const sttEnabled = enabled && !tts.speaking && Date.now() >= sttBlockedUntil;
+    const stt = useSpeechToText(sttEnabled);
+
+    function normalizeSpeechText(text: string) {
+        return text
+            .toLowerCase()
+            .replace(/[^\w\s]/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+    }
+
+    function looksLikeAssistantEcho(text: string) {
+        const candidate = normalizeSpeechText(text);
+        const assistant = normalizeSpeechText(lastAssistantReplyRef.current);
+        if (!candidate || !assistant) return false;
+
+        if (candidate === assistant) return true;
+        if (candidate.length >= 12 && (assistant.includes(candidate) || candidate.includes(assistant))) return true;
+
+        const candidateTokens = candidate.split(" ");
+        const assistantTokens = new Set(assistant.split(" "));
+        const overlap = candidateTokens.filter((token) => assistantTokens.has(token)).length;
+        const ratio = overlap / Math.max(candidateTokens.length, 1);
+        return ratio >= 0.82;
+    }
+
+    function blockSttFor(ms: number) {
+        const nextUntil = Date.now() + ms;
+        setSttBlockedUntil(nextUntil);
+        if (sttBlockTimerRef.current) {
+            window.clearTimeout(sttBlockTimerRef.current);
+        }
+        sttBlockTimerRef.current = window.setTimeout(() => {
+            setSttBlockedUntil(0);
+            sttBlockTimerRef.current = null;
+        }, ms);
+    }
 
     // EMA smoothing for mic level
     useEffect(() => {
@@ -95,6 +136,13 @@ export default function VoiceController({
         transcript.setPartial(stt.partial || "");
     }, [stt.partial]);
 
+    useEffect(() => {
+        if (!sttEnabled) {
+            transcript.setPartial("");
+            stt.clearPartial();
+        }
+    }, [sttEnabled, transcript]);
+
     // Barge-in logic
     useEffect(() => {
         if (!allowBargeIn) return;
@@ -107,6 +155,8 @@ export default function VoiceController({
 
         if (tts.speaking && !inTtsGrace) {
             tts.stop();
+            lastTtsEndRef.current = Date.now();
+            blockSttFor(250);
         }
     }, [userTalking, sttEnabled, tts.speaking, allowBargeIn]);
 
@@ -117,6 +167,11 @@ export default function VoiceController({
 
         // Clear immediately to avoid re-processing same final
         stt.clearFinal();
+
+        const sinceTtsEnded = Date.now() - lastTtsEndRef.current;
+        if (sinceTtsEnded >= 0 && sinceTtsEnded < TTS_ECHO_REJECT_MS && looksLikeAssistantEcho(final)) {
+            return;
+        }
 
         // Drop duplicate finals within the window
         if (shouldDropDuplicate(final)) return;
@@ -139,12 +194,15 @@ export default function VoiceController({
                         : speakAssistant;
 
                 transcript.pushAssistant(reply);
+                lastAssistantReplyRef.current = reply;
 
                 if (reply && shouldSpeak) {
                     lastTtsStartRef.current = Date.now();
                     await tts.say(reply, {
                         // voice: "en-US-Neural2-F",
                     });
+                    lastTtsEndRef.current = Date.now();
+                    blockSttFor(POST_TTS_STT_DELAY_MS);
                 }
             } finally {
                 // small delay to absorb any trailing duplicate finals
@@ -153,11 +211,17 @@ export default function VoiceController({
         })();
     }, [stt.finalText]); // NOTE: keep deps tight so it only runs when finalText changes
 
-    // Small post-TTS delay before flipping STT back on
     useEffect(() => {
-        if (!tts.speaking) {
-            const id = setTimeout(() => {}, POST_TTS_STT_DELAY_MS);
-            return () => clearTimeout(id);
+        return () => {
+            if (sttBlockTimerRef.current) {
+                window.clearTimeout(sttBlockTimerRef.current);
+            }
+        };
+    }, []);
+
+    useEffect(() => {
+        if (tts.speaking) {
+            blockSttFor(TTS_GRACE_MS);
         }
     }, [tts.speaking]);
 

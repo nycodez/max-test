@@ -49,14 +49,17 @@ export function useSpeechToText(enabled: boolean) {
         if (!enabled && hearing) {
             try { r.stop(); } catch {}
         }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [enabled]);
+        if (!enabled) {
+            setPartial("");
+        }
+    }, [enabled, hearing]);
 
     return {
         hearing,
         partial,
         finalText,    // will briefly be set to the final utterance, then you should clear it
         clearFinal: () => setFinalText(null),
+        clearPartial: () => setPartial(""),
         stop: () => recogRef.current?.stop(),
         start: () => recogRef.current?.start(),
     };
